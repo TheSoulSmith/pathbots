@@ -22,6 +22,7 @@ pub trait Path {
         Self: Sized;
 }
 
+/// This exists because I am too lazy to figure out how to use std::io::Read
 pub struct LoadingChunk {
     data: Vec<u8>,
     pos: usize,
