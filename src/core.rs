@@ -214,7 +214,7 @@ pub enum Value {
     Dict(BTreeMap<String, Value>),
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd)]
 pub struct ChunkCoord {
     pub x: i32,
     pub y: i32,
@@ -235,6 +235,21 @@ impl ChunkCoord {
                 None => Err(format!("Failed to read y value")),
             },
             None => Err(format!("Failed to read x value")),
+        }
+    }
+}
+
+impl Ord for ChunkCoord {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match self.y.div_euclid(16).cmp(&other.y.div_euclid(16)) {
+            Equal => match self.x.div_euclid(16).cmp(&other.x.div_euclid(16)) {
+                Equal => match self.y.cmp(&other.y) {
+                    Equal => self.x.cmp(&other.x),
+                    o => o,
+                },
+                o => o,
+            },
+            o => o,
         }
     }
 }
@@ -277,12 +292,9 @@ impl BotPos {
             .map_err(|e| format!("{}\nat bot pos shift", e))?;
         Ok(())
     }
-    fn update_chunk_id(&mut self, coord: ChunkCoord) {
-        match self.chunk.cmp(&coord) {
-            Greater => {}
-            Equal => {} // If it is equal, that means that this is the bot that requested that the chunk that caused the update be loaded,
-            // so it will be passed the id anyway, so nothing needs to happen here.
-            Less => self.chunk_id += 1,
+    fn update_chunk_id(&mut self, index: usize, count: usize) {
+        if self.chunk_id > index {
+            self.chunk_id += count
         }
     }
 }
@@ -314,7 +326,7 @@ impl World {
                 match self.regions.binary_search(&(reg_x, reg_y)) {
                     Ok(_) => {
                         self.chunks.insert(index, Chunk::new_empty(pos));
-                        self.update_bot_chunk_ids(pos);
+                        self.update_bot_chunk_ids(index, 1);
                         Ok(index)
                     }
                     Err(reg_index) => {
@@ -325,7 +337,7 @@ impl World {
                             Ok(t) => Ok(t),
                             Err(e_index) => {
                                 self.chunks.insert(e_index, Chunk::new_empty(pos));
-                                self.update_bot_chunk_ids(pos);
+                                self.update_bot_chunk_ids(e_index, 1);
                                 Ok(e_index)
                             }
                         }
@@ -343,27 +355,26 @@ impl World {
             Err(e) => return Err(format!("{}\nat loading region file `{}`", e, from)),
         };
 
+        let mut insert_chunks = Vec::new();
+
         for chunk in data {
             match chunk {
-                Ok(t) => match self
-                    .chunks
-                    .binary_search_by_key(&t.coord, |check| check.coord)
-                {
-                    Ok(_) => {
-                        return Err(format!(
-                            "Chunk at pos {}, {} is already loaded",
-                            t.coord.x, t.coord.y
-                        ));
-                    }
-                    Err(index) => {
-                        let pos = t.coord.clone();
-                        self.chunks.insert(index, t);
-                        self.update_bot_chunk_ids(pos);
-                    }
-                },
+                Ok(t) => {
+                    insert_chunks.push(t);
+                }
                 Err(e) => return Err(format!("{}\nat loading region file {}", e, from)),
             }
         }
+        match self
+            .chunks
+            .binary_search_by_key(&insert_chunks.get(0).unwrap().coord, |chunk| chunk.coord)
+        {
+            Ok(_) => panic!("This should be unreachable"),
+            Err(index) => {
+                self.update_bot_chunk_ids(index, insert_chunks.len());
+                self.chunks.splice(index..index, insert_chunks)
+            }
+        };
 
         Ok(())
     }
@@ -376,9 +387,9 @@ impl World {
             }
         }
     }
-    fn update_bot_chunk_ids(&mut self, coord: ChunkCoord) {
+    fn update_bot_chunk_ids(&mut self, index: usize, count: usize) {
         for bot in &mut self.bots {
-            bot.pos.update_chunk_id(coord);
+            bot.pos.update_chunk_id(index, count);
         }
     }
     pub fn tick_bots(&mut self) -> Result<(), String> {
