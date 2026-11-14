@@ -1,6 +1,14 @@
 use crate::paths::{BasicPath, NoPath};
-use flate2::write::GzDecoder;
-use std::{cmp::Ordering::*, collections::BTreeMap, fs::read, io::Write};
+use flate2::{
+    Compression,
+    write::{GzDecoder, GzEncoder},
+};
+use std::{
+    cmp::Ordering::*,
+    collections::{BTreeMap, VecDeque},
+    fs::{create_dir_all, read, write},
+    io::Write,
+};
 
 const REG_MAGIC: &[u8; 4] = b"HLID";
 const CHUNK_MAGIC: &[u8; 4] = b"PBCH";
@@ -139,10 +147,10 @@ pub struct LoadingChunk {
 
 impl LoadingChunk {
     fn new(bytes: Vec<u8>) -> Result<Self, String> {
-        if bytes[0..4] != *REG_MAGIC {
+        if bytes.get(..4) != Some(REG_MAGIC.as_slice()) {
             return Err(format!("File magic does not match"));
         }
-        if bytes[2..6] != CHUNK_FORMAT_VERSION.to_be_bytes() {
+        if bytes.get(4..6) != Some(CHUNK_FORMAT_VERSION.to_be_bytes().as_slice()) {
             return Err(format!("File format does not match"));
         }
         let mut data = Vec::new();
@@ -221,13 +229,6 @@ pub struct ChunkCoord {
 }
 
 impl ChunkCoord {
-    fn reg_name(&self) -> String {
-        format!(
-            "reg_{}_{}.dat",
-            self.x.div_euclid(16),
-            self.y.div_euclid(16)
-        )
-    }
     fn load(from: &mut LoadingChunk) -> Result<Self, String> {
         match from.read_i32() {
             Some(x) => match from.read_i32() {
@@ -276,14 +277,14 @@ impl BotPos {
             .map_err(|e| format!("{}\nat bot pos forward shift", e))
     }
     fn shift(&mut self, world: &mut World, dir_x: i32, dir_y: i32) -> Result<(), String> {
-        let mut in_chunk_x = self.in_chunk as i32 & 15 + dir_x;
+        let mut in_chunk_x = (self.in_chunk as i32 & 15) + dir_x;
         let mut in_chunk_y = self.in_chunk as i32 / 16 + dir_y;
-        if (in_chunk_x >= 16) | (in_chunk_x <= -16) {
+        if !(0..16).contains(&in_chunk_x) {
             self.chunk.x += in_chunk_x.div_euclid(16);
             in_chunk_x = in_chunk_x.rem_euclid(16);
         };
-        if (in_chunk_y >= 16) | (in_chunk_y <= -16) {
-            self.chunk.x += in_chunk_y.div_euclid(16);
+        if !(0..16).contains(&in_chunk_y) {
+            self.chunk.y += in_chunk_y.div_euclid(16);
             in_chunk_y = in_chunk_y.rem_euclid(16);
         };
         self.in_chunk = in_chunk_y as u8 * 16 + in_chunk_x as u8;
@@ -293,7 +294,7 @@ impl BotPos {
         Ok(())
     }
     fn update_chunk_id(&mut self, index: usize, count: usize) {
-        if self.chunk_id > index {
+        if self.chunk_id >= index {
             self.chunk_id += count
         }
     }
@@ -302,18 +303,20 @@ impl BotPos {
 /// Stores a world, including chunks and bots
 pub struct World {
     chunks: Vec<Chunk>,
-    bots: Vec<Bot>,
+    bots: VecDeque<Bot>,
     regions: Vec<(i32, i32)>,
     tick: usize,
+    save_address: String,
 }
 
 impl World {
-    pub fn new() -> Self {
+    pub fn new(save_address: String) -> Self {
         Self {
             chunks: Vec::new(),
-            bots: Vec::new(),
+            bots: VecDeque::new(),
             regions: Vec::new(),
             tick: 0,
+            save_address,
         }
     }
 
@@ -331,7 +334,7 @@ impl World {
                     }
                     Err(reg_index) => {
                         self.regions.insert(reg_index, (reg_x, reg_y));
-                        self.load(format!("reg_{}_{}.dat", reg_x, reg_y))
+                        self.load(format!("{}/reg_{}_{}.dat", self.save_address, reg_x, reg_y))
                             .map_err(|e| format!("{}\nat request chunk slot", e))?;
                         match self.chunks.binary_search_by_key(&pos, |chunk| chunk.coord) {
                             Ok(t) => Ok(t),
@@ -383,9 +386,62 @@ impl World {
             Ok(_) => Ok(()),
             Err(index) => {
                 self.regions.insert(index, (reg_x, reg_y));
-                self.load(format!("reg_{}_{}.dat", reg_x, reg_y))
+                self.load(format!("{}/reg_{}_{}.dat", self.save_address, reg_x, reg_y))
             }
         }
+    }
+    pub fn save(&self) -> Result<(), String> {
+        if !self.chunks.is_empty() {
+            create_dir_all(&self.save_address).map_err(|e| {
+                format!("{}\nat creating save directory `{}`", e, self.save_address)
+            })?;
+        }
+
+        let mut start = 0;
+        while start < self.chunks.len() {
+            let first = &self.chunks[start];
+            let reg_x = first.coord.x.div_euclid(CHUNK_SIDE as i32);
+            let reg_y = first.coord.y.div_euclid(CHUNK_SIDE as i32);
+            let mut end = start + 1;
+            while end < self.chunks.len()
+                && self.chunks[end].coord.x.div_euclid(CHUNK_SIDE as i32) == reg_x
+                && self.chunks[end].coord.y.div_euclid(CHUNK_SIDE as i32) == reg_y
+            {
+                end += 1;
+            }
+
+            let mut data = vec![0; 4];
+            for chunk in &self.chunks[start..end] {
+                data.extend_from_slice(CHUNK_MAGIC);
+                data.extend_from_slice(&chunk.coord.x.to_be_bytes());
+                data.extend_from_slice(&chunk.coord.y.to_be_bytes());
+                for column in chunk.cont.iter() {
+                    for path in column.iter() {
+                        data.push(path.kind() as u8);
+                        path.store(&mut data);
+                    }
+                }
+            }
+
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder
+                .write_all(&data)
+                .map_err(|e| format!("{}\nat compressing region {}, {}", e, reg_x, reg_y))?;
+            let compressed = encoder
+                .finish()
+                .map_err(|e| format!("{}\nat finishing region {}, {}", e, reg_x, reg_y))?;
+
+            let mut file_data = Vec::with_capacity(6 + compressed.len());
+            file_data.extend_from_slice(REG_MAGIC);
+            file_data.extend_from_slice(&CHUNK_FORMAT_VERSION.to_be_bytes());
+            file_data.extend_from_slice(&compressed);
+            let file_path = format!("{}/reg_{}_{}.dat", self.save_address, reg_x, reg_y);
+            write(&file_path, file_data)
+                .map_err(|e| format!("{}\nat saving region file `{}`", e, file_path))?;
+            start = end;
+        }
+
+        Ok(())
     }
     fn update_bot_chunk_ids(&mut self, index: usize, count: usize) {
         for bot in &mut self.bots {
@@ -394,21 +450,27 @@ impl World {
     }
     pub fn tick_bots(&mut self) -> Result<(), String> {
         let result = (|| {
-            for index in 0..self.bots.len() {
-                if self.bots[index].run_when != self.tick {
+            let bot_count = self.bots.len();
+            let mut processed_survivors = 0;
+            for _ in 0..bot_count {
+                let mut bot = self
+                    .bots
+                    .pop_front()
+                    .expect("bot count is fixed for this tick");
+                if bot.run_when != self.tick {
+                    self.bots.push_back(bot);
+                    processed_survivors += 1;
                     continue;
                 }
 
-                let path_chunk = self.bots[index].pos.chunk;
-                let path_in_chunk = self.bots[index].pos.in_chunk as usize;
-                let chunk_id = self
-                    .request_chunk_id(path_chunk)
-                    .map_err(|e| format!("{}\nat path check\nat bot execution", e))?;
+                let path_chunk = bot.pos.chunk;
+                let path_chunk_id = bot.pos.chunk_id;
+                let path_in_chunk = bot.pos.in_chunk as usize;
+                let chunk_count = self.chunks.len();
                 let mut path = std::mem::replace(
-                    &mut self.chunks[chunk_id].cont[path_in_chunk / 16][path_in_chunk & 15],
+                    &mut self.chunks[path_chunk_id].cont[path_in_chunk / 16][path_in_chunk & 15],
                     Box::new(NoPath()),
                 );
-                let mut bot = self.bots.remove(index);
 
                 let outcome = if bot.fly_height == 0 {
                     path.bot(&mut bot, self)
@@ -417,19 +479,35 @@ impl World {
                 };
                 bot.run_when += bot.action_time;
 
-                let chunk_id = self
-                    .chunks
-                    .binary_search_by_key(&path_chunk, |loaded| loaded.coord)
-                    .expect("a bot's path chunk cannot be removed during its execution");
-                self.chunks[chunk_id].cont[path_in_chunk / 16][path_in_chunk & 15] = path;
-                bot.pos.chunk_id = self
-                    .chunks
-                    .binary_search_by_key(&bot.pos.chunk, |loaded| loaded.coord)
-                    .expect("a bot's current chunk cannot be removed during its execution");
-                let outcome = outcome.map_err(|e| format!("{}\nat bot execution", e));
-                self.bots.insert(index, bot);
+                let chunks_changed = self.chunks.len() != chunk_count;
+                let path_chunk_id = if chunks_changed {
+                    self.chunks
+                        .binary_search_by_key(&path_chunk, |loaded| loaded.coord)
+                        .expect("a bot's path chunk cannot be removed during its execution")
+                } else {
+                    path_chunk_id
+                };
+                self.chunks[path_chunk_id].cont[path_in_chunk / 16][path_in_chunk & 15] = path;
 
-                outcome?;
+                if chunks_changed {
+                    bot.pos.chunk_id = self
+                        .chunks
+                        .binary_search_by_key(&bot.pos.chunk, |loaded| loaded.coord)
+                        .expect("a bot's current chunk cannot be removed during its execution");
+                }
+
+                match outcome.map_err(|e| format!("{}\nat bot execution", e)) {
+                    Ok(BotState::Terminate) => {}
+                    Ok(BotState::Ok) => {
+                        self.bots.push_back(bot);
+                        processed_survivors += 1;
+                    }
+                    Err(error) => {
+                        self.bots.push_front(bot);
+                        self.bots.rotate_right(processed_survivors);
+                        return Err(error);
+                    }
+                }
             }
             Ok(())
         })();
@@ -441,6 +519,7 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct RecordingPath;
 
@@ -480,11 +559,11 @@ mod tests {
     #[test]
     fn tick_bots_dispatches_based_on_fly_height() {
         let coord = ChunkCoord { x: 0, y: 0 };
-        let mut world = World::new();
+        let mut world = World::new("test_save".to_string());
         world.chunks.push(Chunk::new_empty(coord));
 
         for (in_chunk, fly_height, action_time) in [(0, 0, 2), (1, 1, 3)] {
-            world.bots.push(Bot {
+            world.bots.push_back(Bot {
                 pos: BotPos {
                     chunk: coord,
                     chunk_id: 0,
@@ -546,5 +625,142 @@ mod tests {
             world.bots[1].vars.get("execution_count"),
             Some(Value::Num(count)) if *count == 1.0
         ));
+    }
+
+    #[test]
+    fn tick_bots_removes_terminated_bot_and_continues_with_next_bot() {
+        let coord = ChunkCoord { x: 0, y: 0 };
+        let mut world = World::new("test_save".to_string());
+        world.chunks.push(Chunk::new_empty(coord));
+        world.bots.push_back(Bot {
+            pos: BotPos {
+                chunk: coord,
+                chunk_id: 0,
+                in_chunk: 0,
+                facing: 0,
+            },
+            fly_height: 0,
+            vars: BTreeMap::new(),
+            action_time: 1,
+            run_when: 0,
+        });
+        world.bots.push_back(Bot {
+            pos: BotPos {
+                chunk: coord,
+                chunk_id: 0,
+                in_chunk: 1,
+                facing: 0,
+            },
+            fly_height: 0,
+            vars: BTreeMap::new(),
+            action_time: 1,
+            run_when: 0,
+        });
+        world.chunks[0].cont[0][1] = Box::new(RecordingPath);
+
+        world.tick_bots().unwrap();
+
+        assert_eq!(world.bots.len(), 1);
+        assert!(matches!(
+            world.bots[0].vars.get("execution"),
+            Some(Value::Str(execution)) if execution == "bot"
+        ));
+        assert_eq!(world.bots[0].run_when, 1);
+    }
+
+    #[test]
+    fn tick_bots_keeps_cached_chunk_ids_correct_when_a_chunk_is_inserted() {
+        let coord = ChunkCoord { x: 0, y: 0 };
+        let mut world = World::new("test_save".to_string());
+        world.chunks.push(Chunk::new_empty(coord));
+        world.bots.push_back(Bot {
+            pos: BotPos {
+                chunk: coord,
+                chunk_id: 0,
+                in_chunk: 0,
+                facing: 2,
+            },
+            fly_height: 0,
+            vars: BTreeMap::new(),
+            action_time: 1,
+            run_when: 0,
+        });
+        world.bots.push_back(Bot {
+            pos: BotPos {
+                chunk: coord,
+                chunk_id: 0,
+                in_chunk: 1,
+                facing: 0,
+            },
+            fly_height: 0,
+            vars: BTreeMap::new(),
+            action_time: 1,
+            run_when: 0,
+        });
+        world.chunks[0].cont[0][0] = Box::new(BasicPath());
+        world.chunks[0].cont[0][1] = Box::new(RecordingPath);
+
+        world.tick_bots().unwrap();
+
+        assert_eq!(world.bots[0].pos.chunk, ChunkCoord { x: -1, y: 0 });
+        assert_eq!(world.bots[0].pos.chunk_id, 0);
+        assert_eq!(world.bots[1].pos.chunk_id, 1);
+        assert!(matches!(
+            world.bots[1].vars.get("execution"),
+            Some(Value::Str(execution)) if execution == "bot"
+        ));
+    }
+
+    #[test]
+    fn bot_forward_updates_the_y_chunk_coordinate() {
+        let coord = ChunkCoord { x: 0, y: 0 };
+        let mut world = World::new("test_save".to_string());
+        world.chunks.push(Chunk::new_empty(coord));
+        let mut pos = BotPos {
+            chunk: coord,
+            chunk_id: 0,
+            in_chunk: 0,
+            facing: 3,
+        };
+
+        pos.forward(&mut world).unwrap();
+
+        assert_eq!(pos.chunk, ChunkCoord { x: 0, y: -1 });
+        assert_eq!(pos.in_chunk, 240);
+        assert_eq!(pos.chunk_id, 0);
+    }
+
+    #[test]
+    fn save_round_trips_chunks_by_region() {
+        static NEXT_SAVE_ID: AtomicUsize = AtomicUsize::new(0);
+        let save_address = std::env::temp_dir().join(format!(
+            "pathbots-save-{}-{}",
+            std::process::id(),
+            NEXT_SAVE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let save_address = save_address.to_string_lossy().into_owned();
+        let mut world = World::new(save_address.clone());
+
+        let mut negative_chunk = Chunk::new_empty(ChunkCoord { x: -1, y: -1 });
+        negative_chunk.cont[0][0] = Box::new(BasicPath());
+        world.chunks.push(negative_chunk);
+
+        let mut positive_chunk = Chunk::new_empty(ChunkCoord { x: 16, y: 0 });
+        positive_chunk.cont[15][15] = Box::new(BasicPath());
+        world.chunks.push(positive_chunk);
+
+        world.save().unwrap();
+
+        let mut loaded = World::new(save_address.clone());
+        loaded.load_region(-1, -1).unwrap();
+        loaded.load_region(1, 0).unwrap();
+
+        assert_eq!(loaded.chunks.len(), 2);
+        assert_eq!(loaded.chunks[0].coord, ChunkCoord { x: -1, y: -1 });
+        assert_eq!(loaded.chunks[0].cont[0][0].kind(), PathKind::BasicPath);
+        assert_eq!(loaded.chunks[1].coord, ChunkCoord { x: 16, y: 0 });
+        assert_eq!(loaded.chunks[1].cont[15][15].kind(), PathKind::BasicPath);
+
+        std::fs::remove_dir_all(save_address).unwrap();
     }
 }
