@@ -178,10 +178,10 @@ impl Iterator for LoadingChunk {
 /// Stores a single bot and all the information it needs to function
 pub(crate) struct Bot {
     pos: BotPos,
-    fly_height: usize,
+    fly_height: u8,
     vars: BTreeMap<String, Value>,
-    action_time: usize,
-    run_when: usize,
+    action_time: u64,
+    run_when: u64,
 }
 
 impl Bot {
@@ -201,6 +201,12 @@ impl Bot {
         dir_y: i32,
     ) -> Result<(), String> {
         self.pos.shift(world, dir_x, dir_y)
+    }
+    pub(crate) fn set_action_time(&mut self, action_time: u64) {
+        self.action_time = std::cmp::max(1, action_time);
+    }
+    pub(crate) fn change_action_time(&mut self, change: i64) {
+        self.action_time = std::cmp::max(1, self.action_time.saturating_add_signed(change));
     }
 }
 
@@ -297,7 +303,7 @@ pub(crate) struct World {
     chunks: Vec<Chunk>,
     bots: VecDeque<Bot>,
     regions: Vec<(i32, i32)>,
-    tick: usize,
+    tick: u64,
     save_address: String,
 }
 

@@ -1,4 +1,6 @@
 use crate::core::*;
+mod advanced_movement;
+use advanced_movement::*;
 
 macro_rules! path_kinds {
     ($($kind:ident = $id:literal => $path:ident),+ $(,)?) => {
@@ -43,6 +45,8 @@ path_kinds! {
     LeftDistributor = 9 => LeftDistributor,
     RightDistributor = 10 => RightDistributor,
     Distributor = 11 => Distributor,
+    SpeedUp = 12 => SpeedUp,
+    SlowDown = 13 => SlowDown,
 }
 
 #[derive(Clone, Copy)]
