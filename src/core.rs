@@ -1,4 +1,4 @@
-use crate::paths::{BasicPath, NoPath};
+use crate::paths::{NoPath, PathKind};
 use flate2::{
     Compression,
     write::{GzDecoder, GzEncoder},
@@ -16,7 +16,7 @@ const CHUNK_FORMAT_VERSION: u16 = 1;
 const CHUNK_SIDE: usize = 16;
 
 /// Stores a 16x16 chunk of paths
-pub struct Chunk {
+pub(crate) struct Chunk {
     cont: Box<[[Box<dyn Path>; CHUNK_SIDE]; CHUNK_SIDE]>,
     coord: ChunkCoord,
 }
@@ -96,13 +96,13 @@ impl Chunk {
 }
 
 #[derive(Clone, Copy)]
-pub enum BotState {
+pub(crate) enum BotState {
     Ok,
     Terminate,
 }
 
 /// Defines a struct as qualifying as a path
-pub trait Path {
+pub(crate) trait Path {
     fn bot(&mut self, bot: &mut Bot, world: &mut World) -> Result<BotState, String>;
     fn flyover(&mut self, bot: &mut Bot, world: &mut World) -> Result<BotState, String> {
         bot.forward(world)?;
@@ -115,32 +115,7 @@ pub trait Path {
         Self: Sized;
 }
 
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Stable on-disk identifiers for path types; never reuse an assigned value.
-pub enum PathKind {
-    NoPath = 0,
-    BasicPath = 1,
-}
-
-impl PathKind {
-    fn from_id(id: u8) -> Result<Self, String> {
-        match id {
-            0 => Ok(Self::NoPath),
-            1 => Ok(Self::BasicPath),
-            e => Err(format!("Path id {} is not mapped to a path", e)),
-        }
-    }
-
-    fn load(self, from: &mut LoadingChunk) -> Result<Box<dyn Path>, String> {
-        match self {
-            Self::NoPath => Ok(Box::new(NoPath::load(from)?)),
-            Self::BasicPath => Ok(Box::new(BasicPath::load(from)?)),
-        }
-    }
-}
-
-pub struct LoadingChunk {
+pub(crate) struct LoadingChunk {
     data: Vec<u8>,
     pos: usize,
 }
@@ -165,12 +140,12 @@ impl LoadingChunk {
         };
         Ok(Self { data, pos: 4 })
     }
-    fn read_u8(&mut self) -> Option<u8> {
+    pub(crate) fn read_u8(&mut self) -> Option<u8> {
         let out = self.data.get(self.pos).copied()?;
         self.pos += 1;
         Some(out)
     }
-    fn read_i32(&mut self) -> Option<i32> {
+    pub(crate) fn read_i32(&mut self) -> Option<i32> {
         let end = self.pos.checked_add(4)?;
         let bytes = self.data.get(self.pos..end)?;
         let array: [u8; 4] = bytes.try_into().ok()?;
@@ -201,7 +176,7 @@ impl Iterator for LoadingChunk {
 }
 
 /// Stores a single bot and all the information it needs to function
-pub struct Bot {
+pub(crate) struct Bot {
     pos: BotPos,
     fly_height: usize,
     vars: BTreeMap<String, Value>,
@@ -210,12 +185,26 @@ pub struct Bot {
 }
 
 impl Bot {
-    pub fn forward(&mut self, world: &mut World) -> Result<(), String> {
+    pub(crate) fn forward(&mut self, world: &mut World) -> Result<(), String> {
         self.pos.forward(world)
+    }
+    pub(crate) fn turn(&mut self, turn: i8) {
+        self.pos.turn(turn);
+    }
+    pub(crate) fn set_dir(&mut self, dir: u8) {
+        self.pos.facing = dir & 3
+    }
+    pub(crate) fn shift(
+        &mut self,
+        world: &mut World,
+        dir_x: i32,
+        dir_y: i32,
+    ) -> Result<(), String> {
+        self.pos.shift(world, dir_x, dir_y)
     }
 }
 
-pub enum Value {
+pub(crate) enum Value {
     Str(String),
     Num(f64),
     List(Vec<Value>),
@@ -223,9 +212,9 @@ pub enum Value {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd)]
-pub struct ChunkCoord {
-    pub x: i32,
-    pub y: i32,
+pub(crate) struct ChunkCoord {
+    pub(crate) x: i32,
+    pub(crate) y: i32,
 }
 
 impl ChunkCoord {
@@ -255,7 +244,7 @@ impl Ord for ChunkCoord {
     }
 }
 
-struct BotPos {
+pub(crate) struct BotPos {
     /// The coordinates of the chunk this bot is in
     chunk: ChunkCoord,
     /// The slot in the world that the chunk this bot is in currently occupies
@@ -275,6 +264,9 @@ impl BotPos {
         };
         self.shift(world, dir_x, dir_y)
             .map_err(|e| format!("{}\nat bot pos forward shift", e))
+    }
+    fn turn(&mut self, turn: i8) {
+        self.facing = self.facing.wrapping_add_signed(turn) & 3
     }
     fn shift(&mut self, world: &mut World, dir_x: i32, dir_y: i32) -> Result<(), String> {
         let mut in_chunk_x = (self.in_chunk as i32 & 15) + dir_x;
@@ -301,7 +293,7 @@ impl BotPos {
 }
 
 /// Stores a world, including chunks and bots
-pub struct World {
+pub(crate) struct World {
     chunks: Vec<Chunk>,
     bots: VecDeque<Bot>,
     regions: Vec<(i32, i32)>,
@@ -310,7 +302,7 @@ pub struct World {
 }
 
 impl World {
-    pub fn new(save_address: String) -> Self {
+    pub(crate) fn new(save_address: String) -> Self {
         Self {
             chunks: Vec::new(),
             bots: VecDeque::new(),
@@ -381,7 +373,7 @@ impl World {
 
         Ok(())
     }
-    pub fn load_region(&mut self, reg_x: i32, reg_y: i32) -> Result<(), String> {
+    pub(crate) fn load_region(&mut self, reg_x: i32, reg_y: i32) -> Result<(), String> {
         match self.regions.binary_search(&(reg_x, reg_y)) {
             Ok(_) => Ok(()),
             Err(index) => {
@@ -390,7 +382,7 @@ impl World {
             }
         }
     }
-    pub fn save(&self) -> Result<(), String> {
+    pub(crate) fn save(&self) -> Result<(), String> {
         if !self.chunks.is_empty() {
             create_dir_all(&self.save_address).map_err(|e| {
                 format!("{}\nat creating save directory `{}`", e, self.save_address)
@@ -448,7 +440,7 @@ impl World {
             bot.pos.update_chunk_id(index, count);
         }
     }
-    pub fn tick_bots(&mut self) -> Result<(), String> {
+    pub(crate) fn tick_bots(&mut self) -> Result<(), String> {
         let result = (|| {
             let bot_count = self.bots.len();
             let mut processed_survivors = 0;
@@ -519,6 +511,7 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::BasicPath;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct RecordingPath;
